@@ -1,4 +1,4 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { lstat, readFile, readdir, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { Dirent } from "node:fs";
 import { parseRollJson } from "./schema.ts";
@@ -60,6 +60,8 @@ function timestampFromName(name: string): string | null {
 
 export async function readRollFile(path: string): Promise<PhotoRollRecord | null> {
   try {
+    const info = await lstat(path);
+    if (!info.isFile()) return null;
     const raw = await readFile(path, "utf8");
     const value: unknown = JSON.parse(raw);
     return parseRollJson(value);

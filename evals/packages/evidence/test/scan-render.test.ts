@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -98,4 +98,20 @@ test("renderPrMarkdown binds claim verdicts to uploaded image URLs", () => {
     "https://example.test/01-first.png",
     "pnpm test:proof",
   ]) assert.match(markdown, new RegExp(expected));
+});
+
+test("scanRolls skips a symlinked roll.json without throwing", async () => {
+  const resultsDir = await mkdtemp(join(tmpdir(), "openwork-evidence-symlink-roll-"));
+  try {
+    const rollDir = join(resultsDir, "rolls", "2026-07-02T10-00-00-000Z-symlinked");
+    await mkdir(rollDir, { recursive: true });
+    const outsideRoll = join(resultsDir, "outside-roll.json");
+    await writeFile(outsideRoll, JSON.stringify(record("Outside", rollDir, "2026-07-02T10:00:00.000Z", true)));
+    await symlink(outsideRoll, join(rollDir, "roll.json"));
+
+    const entries = await scanRolls(resultsDir);
+    assert.deepEqual(entries, []);
+  } finally {
+    await rm(resultsDir, { recursive: true, force: true });
+  }
 });

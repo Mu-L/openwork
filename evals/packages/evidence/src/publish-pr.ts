@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { renderPrMarkdown } from "./render.ts";
 import { readRollFile } from "./scan.ts";
@@ -76,9 +76,15 @@ async function uploadImages(
   fetcher: Fetcher,
 ): Promise<Record<string, string>> {
   const urls: Record<string, string> = {};
+  const realDir = await realpath(rollDir);
   for (const file of files) {
     if (basename(file) !== file || !file.toLowerCase().endsWith(".png")) {
       throw new Error(`Refusing to upload invalid roll frame path: ${file}`);
+    }
+    const filePath = join(realDir, file);
+    const stats = await lstat(filePath).catch(() => null);
+    if (!stats?.isFile()) {
+      throw new Error(`Refusing to upload non-regular or symlinked roll frame: ${file}`);
     }
     const pathname = `photo-roll/${encodeURIComponent(rollName)}/${encodeURIComponent(file)}`;
     const response = await fetcher(`${BLOB_API_BASE}/${pathname}`, {
@@ -88,7 +94,7 @@ async function uploadImages(
         "x-content-type": "image/png",
         "x-add-random-suffix": "0",
       },
-      body: await readFile(join(rollDir, file)),
+      body: await readFile(filePath),
     });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 300);

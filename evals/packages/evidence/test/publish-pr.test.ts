@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -63,6 +63,67 @@ test("publishPr dry-run prints composed markdown without upload or gh calls", as
     assert.match(output, /Dry-run claim/);
     assert.match(output, /Dry run: screenshots were not uploaded/);
   } finally {
+    await rm(rollDir, { recursive: true, force: true });
+  }
+});
+
+test("publishPr refuses a symlinked frame before calling the blob uploader", async () => {
+  const root = await mkdtemp(join(tmpdir(), "openwork-evidence-symlink-frame-"));
+  const rollDir = join(root, "roll");
+  const previousToken = process.env.BLOB_READ_WRITE_TOKEN;
+  try {
+    await mkdir(rollDir);
+    await writeFile(join(rollDir, "roll.json"), JSON.stringify(dryRunRecord(rollDir)));
+    const outsideFile = join(root, "private-key");
+    await writeFile(outsideFile, "private material");
+    await symlink(outsideFile, join(rollDir, "01-dry-run.png"));
+    process.env.BLOB_READ_WRITE_TOKEN = "test-token";
+    let fetchCalled = false;
+    const fetcher: Fetcher = async () => {
+      fetchCalled = true;
+      return new Response(JSON.stringify({ url: "https://example.test/unexpected.png" }));
+    };
+    const exec: CommandRunner = () => ({ status: 0, stdout: "", stderr: "" });
+    await assert.rejects(
+      () => publishPr({ pr: 17, rollDir }, { exec, fetch: fetcher }),
+      /Refusing to upload non-regular or symlinked roll frame: 01-dry-run\.png/,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    if (previousToken === undefined) delete process.env.BLOB_READ_WRITE_TOKEN;
+    else process.env.BLOB_READ_WRITE_TOKEN = previousToken;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("publishPr uploads a regular frame and posts the composed comment", async () => {
+  const rollDir = await mkdtemp(join(tmpdir(), "openwork-evidence-regular-frame-"));
+  const previousToken = process.env.BLOB_READ_WRITE_TOKEN;
+  try {
+    await writeFile(join(rollDir, "roll.json"), JSON.stringify(dryRunRecord(rollDir)));
+    await writeFile(join(rollDir, "01-dry-run.png"), Buffer.from("regular png"));
+    process.env.BLOB_READ_WRITE_TOKEN = "test-token";
+    let fetchCalls = 0;
+    const fetcher: Fetcher = async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ url: "https://example.test/regular.png" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const exec: CommandRunner = (_command, args) => ({
+      status: 0,
+      stdout: args.includes("view") ? JSON.stringify({ comments: [] }) : "posted",
+      stderr: "",
+    });
+    const result = await publishPr({ pr: 17, rollDir }, { exec, fetch: fetcher });
+    assert.equal(fetchCalls, 1);
+    assert.equal(result.posted, true);
+    assert.equal(result.updated, false);
+    assert.equal(result.urls["01-dry-run.png"], "https://example.test/regular.png");
+  } finally {
+    if (previousToken === undefined) delete process.env.BLOB_READ_WRITE_TOKEN;
+    else process.env.BLOB_READ_WRITE_TOKEN = previousToken;
     await rm(rollDir, { recursive: true, force: true });
   }
 });
