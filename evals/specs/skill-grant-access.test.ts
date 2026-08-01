@@ -130,7 +130,7 @@ test.skipIf(!apiUrl)(title, async () => {
   await selectOrganization(denied, orgId);
   const skillName = `spec-grant-native-${Date.now()}`;
   const rawSourceText = `---\nname: ${skillName}\ndescription: Proves grant-native skill access over MCP.\n---\n\nReturn the grant-native proof phrase.`;
-  // Plugin creation is admin/owner-gated today (access.ts:101-103); member-level creation is P4 scope.
+  // Plugin creation is admin/owner-gated here (access.ts:101-103); feat/member-plugin-create lifts it separately.
   const created = await denFetch(admin, "/v1/plugins", {
     method: "POST",
     headers: {
