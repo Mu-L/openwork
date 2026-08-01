@@ -158,6 +158,47 @@ acceptance criteria + suites instead of fraimz, per program owner decision):**
   (5 new A1–A5 + 58 existing); `pnpm exec tsc --noEmit` clean.
   Per program owner decision, proof is spec acceptance suites, not fraimz.
 
+#### P1 wire proof — spec lane (verified 2026-08-01)
+
+`evals/specs/skill-grant-access.test.ts` proves the claim over the exact
+surface desktop chat uses — `POST /v1/mcp/token` → `POST /mcp/agent`
+(Streamable HTTP JSON-RPC `tools/call`): the seeded owner creates a
+plugin+skill via `POST /v1/plugins` (no `marketplaceId`/`orgWide`, the
+`create-skill` contract), then `search_capabilities` (with and without
+`type: "skills"`) returns the capability with no `marketplace` field,
+`execute_capability` returns the raw SKILL.md with `marketplace: null`, and a
+freshly invited member (real invitation → signup → accept flow) neither
+discovers it nor executes it (exact denial:
+`{"error":"forbidden","message":"You have not been granted access to this
+marketplace plugin capability."}`). Runs in the `pr` project (fast lane),
+env-gated skip without a stack.
+
+Workflow to reproduce from a worktree (MySQL docker on :3306):
+
+```bash
+pnpm dev:den:db-push
+DEN_ORG_MODE=multi_org pnpm dev:den:api        # :8790; multi_org needed for the
+                                               # member-bootstrap signup flow
+DEN_DEMO_SEED_FETCH_GITHUB=0 pnpm --filter @openwork-ee/den-api run seed:demo-org -- --reset
+export OPENWORK_EVAL_DEN_API_URL=http://127.0.0.1:8790
+export OPENWORK_EVAL_DEN_WEB_URL=http://localhost:3005
+export OPENWORK_EVAL_MARK_VERIFIED_CMD='docker exec openwork-web-local-mysql mysql -uroot -ppassword openwork_den -e "UPDATE \`user\` SET email_verified = 1 WHERE email = '\''{email}'\''"'
+pnpm --dir evals install && pnpm --dir evals run spec specs/skill-grant-access.test.ts
+```
+
+Results: spec passes against a pristine `--reset` seed (both the
+invitation-bootstrap and direct-sign-in paths); full `pr` lane
+`pnpm --dir evals run spec` → 3 files / 5 tests passed; skip path verified;
+`pnpm --dir evals run typecheck` clean.
+
+**Discovered while proving (feeds P4):** `hasPluginArchCapability` ignores its
+capability argument — every plugin-arch capability is admin/owner-only today
+(`access.ts:101-103`). So member-level skill creation does not exist yet;
+P1's "creator" claim holds for whoever may create (admins/owners), and
+opening `plugin.create` per posture is exactly P4's job. The P4 pre-flight
+question about the capability→role mechanism is answered: it is a stub to
+replace.
+
 ### P2 — Share verbs in chat
 
 New builtin `share-plugin` skill (person/team/org → writes a
