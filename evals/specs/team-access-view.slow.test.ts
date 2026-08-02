@@ -1,6 +1,7 @@
 import { expect, onTestFinished, test } from "vitest";
 import { denFetch, ensureMemberSession, evalIn, fill, signIn, waitFor } from "@openwork/behaviors";
 import type { DenSession } from "@openwork/behaviors";
+import { navigate } from "@openwork/cdp";
 import { photoRoll, screenshot, validate } from "@openwork/fraimz";
 import { chrome } from "@openwork/hosts";
 
@@ -228,7 +229,7 @@ test.skipIf(!apiUrl || !webUrl)(title, async () => {
   expect(tokenStored).toBe(true);
 
   const teamUrl = `${webUrl}/dashboard/members/teams/${encodeURIComponent(teamId)}`;
-  await evalIn(browser, `(() => { location.href = ${JSON.stringify(teamUrl)}; return true; })()`);
+  await navigate(browser.client, teamUrl);
   const teamAccessReady = `document.body.innerText.includes(${JSON.stringify(teamName)})
     && document.body.innerText.includes("direct team grant")`;
   let handoffError: unknown;
@@ -276,7 +277,7 @@ test.skipIf(!apiUrl || !webUrl)(title, async () => {
       timeoutMs: 60_000,
       label: "Den Web dashboard after form sign-in",
     });
-    await evalIn(browser, `(() => { location.href = ${JSON.stringify(teamUrl)}; return true; })()`);
+    await navigate(browser.client, teamUrl);
     await waitFor(browser, teamAccessReady, { timeoutMs: 60_000, label: "team name and direct team grant after form sign-in" });
   }
 
