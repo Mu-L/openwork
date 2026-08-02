@@ -392,9 +392,21 @@ test.skipIf(!apiUrl || !webUrl)(title, async () => {
   await new Promise((resolve) => setTimeout(resolve, 250));
 
   await using roll = photoRoll("library-v2");
+  await evalIn(browser, `document.querySelector("[data-dashboard-hero]")?.scrollIntoView({ block: "start" })`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const desktopHeaderShot = await screenshot(browser);
+  const desktopHeaderSeen = await validate(desktopHeaderShot, [
+    "A compact gradient header is titled Library, with its description immediately below and before the tabs",
+  ]);
+  await roll.add(desktopHeaderShot, desktopHeaderSeen);
+  expect(desktopHeaderSeen.ok, desktopHeaderSeen.why).toBe(true);
+
+  await evalIn(browser, `([...document.querySelectorAll('[data-library-item-type="connection"]')]
+    .find((entry) => (entry.textContent ?? "").includes(${JSON.stringify(connection.name)})))
+    ?.scrollIntoView({ block: "center" })`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
   const desktopShot = await screenshot(browser);
   const desktopSeen = await validate(desktopShot, [
-    "A compact gradient header is titled Library, with its description immediately below and before the tabs",
     "A library lists plugin and connection rows with kind and provenance chips",
     "A connection row shows a needs sign-in state with a Sign in action",
   ]);
