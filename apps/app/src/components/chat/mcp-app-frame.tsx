@@ -6,6 +6,8 @@ import { AppBridge, PostMessageTransport } from "@modelcontextprotocol/ext-apps/
 import type { McpUiStyles, McpUiStyleVariableKey } from "@modelcontextprotocol/ext-apps"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 
+import { ConnectionCard } from "./connection-card"
+import { reconnectActionFromChatToolResult } from "@/components/tools/error-attribution"
 import { AppChatArtifact } from "@/react-app/domains/apps/app-chat-artifact"
 import { openDesktopUrl } from "@/app/lib/desktop"
 import {
@@ -559,6 +561,13 @@ export function McpAppSandboxView({ app, toolName, inputArguments, result, unava
 }
 
 export function McpAppFrame({ part }: { part: DynamicToolUIPart }) {
+  const result = preservedResult(part)
+  const action = reconnectActionFromChatToolResult(part.toolName, result?.structuredContent ?? part.output)
+  if (action) return <ConnectionCard part={part} action={action} />
+  return <EmbeddedMcpAppFrame part={part} />
+}
+
+function EmbeddedMcpAppFrame({ part }: { part: DynamicToolUIPart }) {
   const { openworkServerClient, workspaceId } = useWorkspace()
   const nextResult = preservedResult(part)
   const nextResultSignature = JSON.stringify(nextResult)

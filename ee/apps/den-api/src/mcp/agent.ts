@@ -87,6 +87,8 @@ import {
 import { registerAgentSkillCreatedApp } from "./skill-created-app.js"
 import {
   connectedConnectionActionPayload,
+  connectionActionSearchCard,
+  connectionActionPayloadSchema,
   connectionActionPayloadFromStatus,
   registerAgentConnectionActionApp,
 } from "./connection-action-app.js"
@@ -161,6 +163,7 @@ const capabilityMatchOutputSchema = z.object({
 
 export const SEARCH_CAPABILITIES_OUTPUT_SCHEMA = z.object({
   matches: z.array(capabilityMatchOutputSchema),
+  connectionAction: connectionActionPayloadSchema.optional(),
   hint: z.string().optional(),
 })
 
@@ -179,7 +182,7 @@ export const AGENT_MCP_INSTRUCTIONS = [
   "Do not invent OAuth-client, credential, or local-extension setup. Organization connections are managed in the OpenWork Cloud dashboard / Settings > Connect; when a connection or marketplace readiness state requires administrator setup or member sign-in, relay that exact action.",
   "External MCP matches include the provider-advertised argumentsSchema, schemaDigest, and invocation.argumentsField. Put an object matching argumentsSchema in execute_capability.body and copy schemaDigest into execute_capability.schemaDigest. OpenWork always attempts the downstream provider call even when local schema checks find a mismatch; schemaGuidance is advisory: if the provider succeeded, accept the result and do not retry because of the warning; if it failed, use the warning to correct the arguments or search again.",
   "If the provider returns invalid_capability_arguments, correct the listed issues and retry once with changed arguments; never retry the same arguments unchanged. If it returns unknown_capability, call search_capabilities again before retrying.",
-  "When a match has kind connection_status, execute that exact match once: it returns the live status and renders an actionable connection card for the member in compatible hosts. When execute_capability fails with needs_connection or connection_not_connected, execute that connection's status capability (mcp:<connectionId>:*) once for the same card. In both cases name connectionStatus.connectionName and relay connectionStatus.action exactly in text, distinguishing the member's Your Connections page, the organization Connections dashboard, and the provider's own admin console. Probes are live: after the human fixes the connector, search again in the same task; otherwise do not retry unchanged or improvise workarounds through other tools.",
+  "When the user asks to connect a service, search for that service by name. When a match has kind connection_status, search already renders its connection card in compatible hosts when the result identifies one connection. Do not execute the same status again when the search response includes connectionAction. Otherwise execute that exact match once to render its card. When execute_capability fails with needs_connection or connection_not_connected, execute that connection's status capability (mcp:<connectionId>:*) once for the same card. For member-owned OAuth connections in OpenWork desktop, ask the user to click Connect or Reconnect on the inline card; desktop handles authorization directly, so do not send them to Den. For other actions, name connectionStatus.connectionName and relay connectionStatus.action exactly in text, distinguishing the member's Your Connections page, the organization Connections dashboard, and the provider's own admin console. Probes are live: after the human fixes the connector, search again in the same task; otherwise do not retry unchanged or improvise workarounds through other tools.",
   "Successful postMarketplacesPlugins, postPluginsAccess, and postMarketplacesAccess calls render a confirmation card automatically in compatible hosts; report the outcome in text as well.",
 ].join("\n")
 
@@ -234,10 +237,16 @@ export function capabilitySearchToolResult<T extends CapabilityMatch>(matches: T
     ...(matches.length === 0 ? ["No matches. Try broader or different keywords."] : []),
     ...(coverageHint ? [coverageHint] : []),
   ].join(" ")
-  const result = hint ? { matches, hint } : { matches }
+  const card = connectionActionSearchCard(matches)
+  const result = {
+    matches,
+    ...(hint ? { hint } : {}),
+    ...(card ? { connectionAction: card.connectionAction } : {}),
+  }
   return {
     content: textContent(JSON.stringify(result, null, 2)),
     structuredContent: result,
+    ...(card ? { _meta: card.meta } : {}),
   }
 }
 
