@@ -146,6 +146,7 @@ import { buildOpenworkRuntimeConfigObject, openworkRuntimeConfigFilePath, writeO
 import { findManagedEngineWorkspace } from "./workspaces.js";
 import { startThreadApprovalReplayer, type ThreadApprovalReplayer } from "./thread-approvals.js";
 import { CloudProviderSync, parseCloudProviderDenSession } from "./cloud-provider-sync.js";
+import { createEngineV2Preview, type EngineV2Preview } from "./engine-v2-preview.js";
 import pkg from "../package.json" with { type: "json" };
 import constants from "../../../constants.json" with { type: "json" };
 
@@ -828,6 +829,19 @@ function parseWorkspaceOpencodeMount(pathname: string): { workspaceId: string; r
   return { workspaceId: decodeURIComponent(workspaceId), restPath };
 }
 
+function parseWorkspaceOpencodeV2Mount(pathname: string): { workspaceId: string; restPath: string } | null {
+  if (!pathname.startsWith("/workspace/")) return null;
+  const remainder = pathname.slice("/workspace/".length);
+  if (!remainder) return null;
+  const slash = remainder.indexOf("/");
+  if (slash === -1) return null;
+  const workspaceId = remainder.slice(0, slash);
+  const restPath = remainder.slice(slash) || "/";
+  if (!workspaceId.trim()) return null;
+  if (restPath !== "/opencode2" && !restPath.startsWith("/opencode2/")) return null;
+  return { workspaceId: decodeURIComponent(workspaceId), restPath };
+}
+
 function normalizeOpencodeProxyPath(proxyPath: string): string {
   const raw = (proxyPath ?? "").trim() || "/";
   const withoutPrefix = raw.startsWith("/opencode") ? raw.slice("/opencode".length) : raw;
@@ -1005,6 +1019,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     },
     logger: toManagedProviderAuthLogger(logger),
   });
+  const engineV2Preview = createEngineV2Preview({ config });
   const routes = createRoutes(
     config,
     approvals,
@@ -1014,6 +1029,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     engineMcpServerState,
     logger,
     cloudProviderSync,
+    engineV2Preview,
   );
 
   const serverOptions: {
@@ -1090,6 +1106,42 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
         }
       };
 
+      const proxyWorkspaceOpencodeV2Mount = async (mount: { workspaceId: string; restPath: string }) => {
+        authMode = "client";
+        try {
+          const actor = await requireClient(request, config, tokens);
+          assertOpencodeProxyAllowed(actor, request.method, mount.restPath);
+          const workspace = await resolveWorkspaceWithoutBootstrap(config, mount.workspaceId);
+          const connection = engineV2Preview.connection();
+          if (!connection) {
+            return finalize(jsonResponse({ error: "engine_v2_preview_not_running" }, 503));
+          }
+          proxyService = "opencode";
+          proxyBaseUrl = connection.url;
+          const response = await proxyOpencodeV2Request({
+            config,
+            request,
+            url,
+            workspace,
+            proxyPath: mount.restPath,
+            connection,
+          });
+          return finalize(response);
+        } catch (error) {
+          const requestCanceled = isExpectedRequestCancellation(error, request.signal);
+          if (!(error instanceof ApiError) && !requestCanceled) {
+            captureServerException(error, { method: request.method, route: "/workspace/:id/opencode2/*", requestSignal: request.signal });
+          }
+          const apiError = error instanceof ApiError
+            ? error
+            : requestCanceled
+              ? new ApiError(499, "request_aborted", "Request was canceled")
+              : new ApiError(500, "internal_error", "Unexpected server error");
+          recordApiError(apiError);
+          return finalize(jsonResponse(formatError(apiError), apiError.status));
+        }
+      };
+
       if (request.method === "OPTIONS") {
         return finalize(new Response(null, { status: 204 }));
       }
@@ -1097,6 +1149,11 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
       const canonicalOpencodeMount = parseWorkspaceOpencodeMount(url.pathname);
       if (canonicalOpencodeMount) {
         return proxyWorkspaceOpencodeMount(canonicalOpencodeMount);
+      }
+
+      const canonicalOpencodeV2Mount = parseWorkspaceOpencodeV2Mount(url.pathname);
+      if (canonicalOpencodeV2Mount) {
+        return proxyWorkspaceOpencodeV2Mount(canonicalOpencodeV2Mount);
       }
 
       const mount = parseWorkspaceMount(url.pathname);
@@ -1221,6 +1278,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
   } catch (error) {
     captureServerException(error, { method: "START", route: "startServer" });
     cloudProviderSync.stop();
+    await engineV2Preview.stop().catch(() => undefined);
     engineInstanceReaper.close();
     clearEngineInstanceReaperForConfig(config);
     invalidateEngineMcpServerState(config, engineMcpServerState);
@@ -1261,6 +1319,7 @@ export async function startServer(config: ServerConfig): Promise<ServeResult> {
     ...server,
     stop: async () => {
       cloudProviderSync.stop();
+      await engineV2Preview.stop().catch(() => undefined);
       engineInstanceReaper.close();
       clearEngineInstanceReaperForConfig(config);
       invalidateEngineMcpServerState(config, engineMcpServerState);
@@ -1277,6 +1336,168 @@ function buildOpencodeProxyUrl(baseUrl: string, path: string, search: string) {
   target.pathname = trimmedPath.startsWith("/") ? trimmedPath : `/${trimmedPath}`;
   target.search = search;
   return target.toString();
+}
+
+async function proxyOpencodeV2Request(input: {
+  config: ServerConfig;
+  request: Request;
+  url: URL;
+  workspace: WorkspaceInfo;
+  proxyPath: string;
+  connection: { url: string; username: string; password: string };
+}): Promise<Response> {
+  const method = input.request.method.toUpperCase();
+  if (method !== "GET" && method !== "HEAD") ensureWritable(input.config);
+
+  const withoutPrefix = input.proxyPath.slice("/opencode2".length);
+  const forwardedPath = withoutPrefix || "/";
+  // Runtime provider configuration contains server-owned credentials. The
+  // renderer uses the catalog/status APIs; it must not read or mutate this file.
+  if (/^\/api\/config(?:\/|$)/.test(decodeURIComponent(forwardedPath))) {
+    throw new ApiError(403, "engine_config_private", "Engine configuration is private");
+  }
+  const target = new URL(input.connection.url);
+  target.pathname = forwardedPath;
+  target.search = input.url.search;
+  if (forwardedPath.startsWith("/api/")) {
+    for (const key of [...target.searchParams.keys()]) {
+      if (key === "location" || key.startsWith("location[")) target.searchParams.delete(key);
+    }
+    target.searchParams.set("location[directory]", input.workspace.path);
+  }
+
+  const headers = new Headers(input.request.headers);
+  headers.delete("authorization");
+  headers.delete("x-openwork-host-token");
+  headers.delete("x-openwork-client-id");
+  headers.delete("host");
+  headers.delete("origin");
+  headers.set("authorization", `Basic ${Buffer.from(`opencode:${input.connection.password}`).toString("base64")}`);
+
+  // The v2 daemon has a global session namespace: a location query does not
+  // prevent reading a session owned by another workspace. Match the v1 mount's
+  // ownership boundary before forwarding session reads or mutations.
+  const sessionMatch = forwardedPath.match(/^\/api\/session\/([^/]+)(?:\/|$)/);
+  const sessionId = sessionMatch?.[1] ? decodeURIComponent(sessionMatch[1]) : null;
+  if (sessionId?.startsWith("ses_")) {
+    const sessionUrl = new URL(target);
+    sessionUrl.pathname = `/api/session/${encodeURIComponent(sessionId)}`;
+    sessionUrl.search = "";
+    sessionUrl.searchParams.set("location[directory]", input.workspace.path);
+    const sessionHeaders = new Headers(headers);
+    sessionHeaders.delete("content-length");
+    sessionHeaders.delete("transfer-encoding");
+    const sessionResponse = await loopbackFetch(sessionUrl.toString(), {
+      headers: sessionHeaders,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!sessionResponse.ok) return sanitizeProxyResponse(sessionResponse);
+    const payload: unknown = await sessionResponse.json();
+    const data = isRecord(payload) && isRecord(payload.data) ? payload.data : payload;
+    const session = isRecord(data) && isRecord(data.info) ? data.info : data;
+    const location = isRecord(session) && isRecord(session.location) ? session.location : null;
+    const directory = location && typeof location.directory === "string" ? location.directory : null;
+    const [expected, actual] = await Promise.all([
+      realpath(input.workspace.path).catch(() => input.workspace.path),
+      directory ? realpath(directory).catch(() => directory) : null,
+    ]);
+    if (!actual || actual !== expected) {
+      throw new ApiError(404, "session_not_found", "Session not found");
+    }
+  }
+
+  const requestBody = method === "GET" || method === "HEAD"
+    ? undefined
+    : await input.request.arrayBuffer().then((buffer) => buffer.byteLength > 0 ? buffer : undefined);
+  let body: string | ArrayBuffer | undefined = requestBody;
+  if (method === "POST" && forwardedPath === "/api/session") {
+    let sessionInput: unknown = {};
+    if (requestBody) {
+      try {
+        sessionInput = JSON.parse(new TextDecoder().decode(requestBody));
+      } catch {
+        throw new ApiError(400, "invalid_body", "Expected a JSON object");
+      }
+    }
+    if (!isRecord(sessionInput)) throw new ApiError(400, "invalid_body", "Expected a JSON object");
+    // Unlike reads, v2 session creation binds its location from the body.
+    body = JSON.stringify({ ...sessionInput, location: { directory: input.workspace.path } });
+    headers.delete("content-length");
+    headers.set("content-type", "application/json");
+  }
+  const response = await loopbackFetch(target.toString(), { method, headers, body });
+  if (method === "GET" && /^\/api\/event\/*$/.test(decodeURIComponent(forwardedPath)) && response.ok && response.body) {
+    const expected = await realpath(input.workspace.path);
+    const frames = new BoundedSseFrameBuffer();
+    const encoder = new TextEncoder();
+    const scopedBody = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(": connected\n\n"));
+      },
+      async transform(chunk, controller) {
+        const parsed = frames.push(chunk);
+        if (parsed.overflow) throw new Error("OpenCode v2 event frame exceeded the size limit");
+        for (const frame of parsed.frames) {
+          let scopedFrame = frame;
+          let payload = parseSsePayload(frame);
+          if (typeof payload === "string") {
+            try { payload = JSON.parse(payload); } catch { continue; }
+          }
+          // v2 execution lifecycle events omit location. Resolve their session
+          // through the daemon before forwarding; the event's session ID alone
+          // is not proof of workspace ownership.
+          if (isRecord(payload) && payload.location === undefined
+            && typeof payload.type === "string"
+            && /^session\.execution\.(started|succeeded|failed|interrupted)$/.test(payload.type)
+            && isRecord(payload.data) && typeof payload.data.sessionID === "string"
+            && payload.data.sessionID.startsWith("ses_")) {
+            const sessionUrl = new URL(input.connection.url);
+            sessionUrl.pathname = `/api/session/${encodeURIComponent(payload.data.sessionID)}`;
+            const ownedSession: unknown = await loopbackFetch(sessionUrl.toString(), {
+              headers: { authorization: `Basic ${Buffer.from(`opencode:${input.connection.password}`).toString("base64")}` },
+              signal: AbortSignal.any([input.request.signal, AbortSignal.timeout(5_000)]),
+            }).then(async (result) => result.ok ? result.json() : null).catch(() => null);
+            const data = isRecord(ownedSession) && isRecord(ownedSession.data) ? ownedSession.data : ownedSession;
+            const session = isRecord(data) && isRecord(data.info) ? data.info : data;
+            if (isRecord(session) && isRecord(session.location)) {
+              payload = { ...payload, location: session.location };
+              scopedFrame = `data: ${JSON.stringify(payload)}`;
+            }
+          }
+          const location = isRecord(payload) && isRecord(payload.location) ? payload.location : null;
+          const directory = location && typeof location.directory === "string" ? location.directory : null;
+          if (!directory || await realpath(directory).catch(() => null) !== expected) continue;
+          controller.enqueue(encoder.encode(`${scopedFrame}\n\n`));
+        }
+      },
+    }));
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-length");
+    responseHeaders.delete("content-encoding");
+    return sanitizeProxyResponse(new Response(scopedBody, { status: response.status, headers: responseHeaders }));
+  }
+  if (method === "GET" && forwardedPath === "/api/session" && response.ok) {
+    const payload: unknown = await response.json();
+    const data = isRecord(payload) && "data" in payload ? payload.data : payload;
+    const items = Array.isArray(data) ? data : isRecord(data) && Array.isArray(data.items) ? data.items : null;
+    if (!items) throw new ApiError(502, "invalid_engine_response", "Invalid session list response");
+    const expected = await realpath(input.workspace.path).catch(() => input.workspace.path);
+    const scoped = (await Promise.all(items.map(async (item: unknown) => {
+      const session = isRecord(item) && isRecord(item.info) ? item.info : item;
+      const location = isRecord(session) && isRecord(session.location) ? session.location : null;
+      const directory = location && typeof location.directory === "string" ? location.directory : null;
+      if (!directory) return null;
+      const actual = await realpath(directory).catch(() => directory);
+      return actual === expected ? item : null;
+    }))).filter((item) => item !== null);
+    const scopedData = isRecord(data) ? { ...data, items: scoped } : scoped;
+    const scopedPayload = isRecord(payload) && "data" in payload ? { ...payload, data: scopedData } : scopedData;
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.delete("content-length");
+    responseHeaders.delete("content-encoding");
+    return sanitizeProxyResponse(new Response(JSON.stringify(scopedPayload), { status: response.status, headers: responseHeaders }));
+  }
+  return sanitizeProxyResponse(response);
 }
 
 function opencodeUnreachableError(error: unknown, path: string): ApiError {
@@ -2189,6 +2410,7 @@ function createRoutes(
   engineMcpServerState: EngineMcpServerState,
   logger: ServerLogger,
   cloudProviderSync: CloudProviderSync,
+  engineV2Preview: EngineV2Preview,
 ): Route[] {
   const routes: Route[] = [];
   // A rollover-capable pool can apply this immediately without disposing
@@ -2751,6 +2973,29 @@ function createRoutes(
 
   addRoute(routes, "GET", "/cloud-provider-sync/status", "client", async () => {
     return jsonResponse(cloudProviderSync.status());
+  });
+
+  addRoute(routes, "GET", "/experimental/engine-v2-preview/status", "client", async () => {
+    return jsonResponse(engineV2Preview.status());
+  });
+
+  addRoute(routes, "PUT", "/experimental/engine-v2-preview", "client", async (ctx) => {
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const body = await readJsonBody(ctx.request);
+    if (!isRecord(body) || (body.enabled === undefined && body.chatRouting === undefined)) {
+      throw new ApiError(400, "invalid_payload", "enabled or chatRouting must be provided");
+    }
+    if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+      throw new ApiError(400, "invalid_payload", "enabled must be a boolean");
+    }
+    if (body.chatRouting !== undefined && typeof body.chatRouting !== "boolean") {
+      throw new ApiError(400, "invalid_payload", "chatRouting must be a boolean");
+    }
+    let status = engineV2Preview.status();
+    if (typeof body.enabled === "boolean") status = await engineV2Preview.setEnabled(body.enabled);
+    if (typeof body.chatRouting === "boolean") status = await engineV2Preview.setChatRouting(body.chatRouting);
+    return jsonResponse(status);
   });
 
   addRoute(routes, "PATCH", "/runtime-config/providers", "host-token", async (ctx) => {

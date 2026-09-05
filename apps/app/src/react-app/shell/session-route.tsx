@@ -2083,11 +2083,13 @@ export function SessionRoute() {
     if (!endpoint || !endpoint.token) {
       return null;
     }
-    const workspaceClient = createClient(
-      endpoint.opencodeBaseUrl,
-      workspace.path?.trim() || undefined,
-      { token: endpoint.token, mode: "openwork" },
-    );
+    const workspaceClient = workspaceId === selectedWorkspaceId && opencodeClient
+      ? opencodeClient
+      : createClient(
+          endpoint.opencodeBaseUrl,
+          workspace.path?.trim() || undefined,
+          { token: endpoint.token, mode: "openwork" },
+        );
     const toastId = taskCreateUnavailableToastId(workspaceId);
     const attempts = TASK_CREATE_RETRY_DELAYS_MS.length + 1;
     try {
@@ -2190,7 +2192,7 @@ export function SessionRoute() {
       }
       return null;
     }
-  }, [applyLastUsedModelToSession, developerMode, endpointForWorkspace, loading, navigateToWorkspaceSession, refreshCloudProviderSync, refreshRouteState, rememberPendingCreatedSession, retryingWorkspaceIds, selectedWorkspaceId, workspaces]);
+  }, [applyLastUsedModelToSession, developerMode, endpointForWorkspace, loading, navigateToWorkspaceSession, opencodeClient, refreshCloudProviderSync, refreshRouteState, rememberPendingCreatedSession, retryingWorkspaceIds, selectedWorkspaceId, workspaces]);
 
   const handleCreateTaskInWorkspace = useCallback((workspaceId: string): Promise<string | null> => {
     const { focusedPane, secondary } = useWorkbenchStore.getState();
@@ -2477,6 +2479,9 @@ export function SessionRoute() {
         if (!parent) return { ok: false, error: "The selected session is unavailable." };
 
         const childSessionId = `${selectedSessionId}:eval-child`;
+        // Match a real session.created event: a concurrent list snapshot must
+        // not remove this newly seeded child before its approval is answered.
+        rememberPendingCreatedSession(selectedWorkspaceId, childSessionId);
         const request: PendingPermission = {
           id: `${selectedSessionId}:eval-child-permission`,
           sessionID: childSessionId,
@@ -2521,7 +2526,7 @@ export function SessionRoute() {
         return { childSessionId };
       },
     };
-  }, [selectedSessionId, selectedWorkspaceEndpoint?.workspaceId, selectedWorkspaceId, sessionsByWorkspaceId, setSessionsByWorkspaceId]);
+  }, [rememberPendingCreatedSession, selectedSessionId, selectedWorkspaceEndpoint?.workspaceId, selectedWorkspaceId, sessionsByWorkspaceId, setSessionsByWorkspaceId]);
   useControlAction(seedChildPermissionControlAction);
 
   const commandPaletteControlAction = useMemo<OpenworkControlAction>(() => ({
