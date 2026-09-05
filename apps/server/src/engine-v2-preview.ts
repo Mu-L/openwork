@@ -18,6 +18,8 @@ import {
   readGlobalRuntimeOpencodeConfig,
   runtimeProviderMap,
 } from "./runtime-opencode-config-store.js";
+import type { EnvService } from "./env-file.js";
+import { selectPrimaryCredentialEnvName } from "./managed-provider-auth.js";
 import type { ServerConfig } from "./types.js";
 
 const OPENCODE_V2_VERSION = constants.opencodeV2Version;
@@ -55,6 +57,7 @@ export interface EngineV2Preview {
   setEnabled(enabled: boolean): Promise<EngineV2PreviewStatus>;
   setChatRouting(chatRouting: boolean): Promise<EngineV2PreviewStatus>;
   connection(): { url: string; username: string; password: string } | undefined;
+  ensureWorkspaceReady(directory: string): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -147,36 +150,81 @@ async function resolveBinary(config: ServerConfig): Promise<ResolvedBinary> {
 
 export function mapRuntimeProvidersToV2Specs(
   providerMap: Record<string, unknown>,
+  storedCredentials: ReadonlyMap<string, string> = new Map(),
 ): { specs: OpencodeV2ProviderSpec[]; skippedProviderIds: string[] } {
   const specs: OpencodeV2ProviderSpec[] = [];
   const skippedProviderIds: string[] = [];
 
   for (const [id, value] of Object.entries(providerMap)) {
-    if (!isRecord(value) || !isRecord(value.options)) {
+    if (!isRecord(value)) {
       skippedProviderIds.push(id);
       continue;
     }
-    const baseUrl = value.options.baseURL;
-    if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
+    // Only built-in adapters: do not turn organization configuration into a
+    // request to install an arbitrary runtime package.
+    const packages: Record<string, string> = {
+      "@ai-sdk/openai": "@opencode-ai/ai/providers/openai",
+      "@ai-sdk/anthropic": "@opencode-ai/ai/providers/anthropic",
+      "@openrouter/ai-sdk-provider": "@opencode-ai/ai/providers/openrouter",
+      "@ai-sdk/openai-compatible": "@opencode-ai/ai/providers/openai-compatible",
+    };
+    const options = isRecord(value.options) ? value.options : {};
+    // Catalog `api` metadata may use only the native adapter's trusted origin.
+    // Custom destinations must use the existing explicit options.baseURL path.
+    const explicitBaseUrl = typeof options.baseURL === "string" && options.baseURL.trim()
+      ? options.baseURL : undefined;
+    if (!explicitBaseUrl && value.api !== undefined) {
+      const nativeOrigins: Record<string, string> = {
+        "@ai-sdk/openai": "https://api.openai.com",
+        "@ai-sdk/anthropic": "https://api.anthropic.com",
+        "@openrouter/ai-sdk-provider": "https://openrouter.ai",
+      };
+      let trusted = false;
+      try {
+        const url = new URL(typeof value.api === "string" ? value.api : "");
+        trusted = typeof value.npm === "string" && Object.hasOwn(nativeOrigins, value.npm)
+          && url.origin === nativeOrigins[value.npm] && !url.username && !url.password;
+      } catch { /* Invalid endpoint metadata is never mirrored. */ }
+      if (!trusted) { skippedProviderIds.push(id); continue; }
+    }
+    const endpoint = explicitBaseUrl ?? value.api;
+    const baseUrl = typeof endpoint === "string" && endpoint.trim() ? endpoint : undefined;
+    const packageName = typeof value.npm === "string" && Object.hasOwn(packages, value.npm) ? packages[value.npm] : undefined;
+    if ((value.npm !== undefined && !packageName)
+      || (!baseUrl && (!packageName || value.npm === "@ai-sdk/openai-compatible"))) {
       skippedProviderIds.push(id);
       continue;
     }
-
+    const { apiKey, baseURL, headers, ...settings } = options;
+    const envNames = Array.isArray(value.env)
+      ? value.env.filter((name): name is string => typeof name === "string") : [];
+    const credentialName = selectPrimaryCredentialEnvName(envNames, storedCredentials.keys());
+    const storedKey = credentialName ? storedCredentials.get(credentialName) : undefined;
+    // Resolve only this provider's declared credential, never inherit the
+    // server environment or copy unrelated secrets into the sidecar.
+    const explicitKey = typeof apiKey === "string" && apiKey.trim() !== "" && !apiKey.includes("{env:") ? apiKey : undefined;
+    const resolvedKey = explicitKey ?? storedKey;
+    if (envNames.length > 0 && !resolvedKey) {
+      skippedProviderIds.push(id);
+      continue;
+    }
     const models = isRecord(value.models)
       ? Object.entries(value.models)
         .map(([modelId, model]) => ({
           id: modelId,
           name: isRecord(model) && typeof model.name === "string" ? model.name : modelId,
+          ...(isRecord(model) ? { config: model } : {}),
         }))
         .sort((left, right) => left.id.localeCompare(right.id))
       : [];
     specs.push({
       id,
       name: typeof value.name === "string" ? value.name : id,
-      baseUrl,
-      apiKey: typeof value.options.apiKey === "string" && value.options.apiKey !== ""
-        ? value.options.apiKey
-        : UNSET_API_KEY,
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(packageName ? { package: packageName } : {}),
+      ...(Object.keys(settings).length ? { settings } : {}),
+      ...(isRecord(headers) ? { headers } : {}),
+      apiKey: resolvedKey ?? UNSET_API_KEY,
       models,
     });
   }
@@ -216,7 +264,7 @@ function catalogModelIds(payload: unknown, mirroredProviderIds: string[]): strin
   return [...ids].sort((left, right) => left.localeCompare(right));
 }
 
-export function createEngineV2Preview(options: { config: ServerConfig }): EngineV2Preview {
+export function createEngineV2Preview(options: { config: ServerConfig; env?: Pick<EnvService, "list" | "onChange"> }): EngineV2Preview {
   const { config } = options;
   const rootDir = join(runtimeStorageDir(config), "opencode-v2", "state");
   const workspaceDir = join(rootDir, "workspace");
@@ -238,6 +286,8 @@ export function createEngineV2Preview(options: { config: ServerConfig }): Engine
   let startPromise: Promise<void> | undefined;
   let mirrorInFlight: Promise<void> | undefined;
   let mirrorDirty = false;
+  const workspaceReadiness = new Map<string, Promise<void>>();
+  let mirroredSpecs: OpencodeV2ProviderSpec[] = [];
 
   function status(): EngineV2PreviewStatus {
     return {
@@ -259,9 +309,12 @@ export function createEngineV2Preview(options: { config: ServerConfig }): Engine
     const active = sidecar;
     if (!active) return;
     const providerMap = runtimeProviderMap(await readGlobalRuntimeOpencodeConfig(config));
-    const mapped = mapRuntimeProvidersToV2Specs(providerMap);
+    const credentials = new Map((await options.env?.list() ?? []).map((entry) => [entry.key, entry.value]));
+    const mapped = mapRuntimeProvidersToV2Specs(providerMap, credentials);
     const nextMirroredProviderIds = mapped.specs.map((spec) => spec.id);
     await active.setProviders(mapped.specs);
+    mirroredSpecs = mapped.specs;
+    workspaceReadiness.clear();
     mirroredProviderIds = nextMirroredProviderIds;
     skippedProviderIds = [...mapped.skippedProviderIds];
     lastMirroredAt = new Date().toISOString();
@@ -307,6 +360,7 @@ export function createEngineV2Preview(options: { config: ServerConfig }): Engine
 
   async function closeSidecar(): Promise<void> {
     const active = sidecar;
+    workspaceReadiness.clear();
     sidecar = undefined;
     running = false;
     version = undefined;
@@ -340,10 +394,12 @@ export function createEngineV2Preview(options: { config: ServerConfig }): Engine
       version = health.version;
       pid = health.pid;
       running = health.healthy;
-      unsubscribe = onRuntimeOpencodeConfigWrite((_writeConfig, workspaceId) => {
+      const unsubscribeConfig = onRuntimeOpencodeConfigWrite((_writeConfig, workspaceId) => {
         if (!isEngineGlobalRuntimeConfigId(workspaceId)) return;
         scheduleMirror();
       });
+      const unsubscribeEnv = options.env?.onChange(scheduleMirror);
+      unsubscribe = () => { unsubscribeConfig(); unsubscribeEnv?.(); };
       scheduleMirror();
       if (mirrorInFlight) await mirrorInFlight;
       if (!enabled || !allowRunning) {
@@ -414,10 +470,38 @@ export function createEngineV2Preview(options: { config: ServerConfig }): Engine
     return { url: sidecar.url, username: sidecar.username, password: sidecar.password };
   }
 
+  async function ensureWorkspaceReady(directory: string): Promise<void> {
+    if (mirrorInFlight) await mirrorInFlight;
+    const active = sidecar;
+    if (!active) throw new Error("OpenCode v2 is not running");
+    const existing = workspaceReadiness.get(directory);
+    if (existing) return existing;
+    // V2 discovers configuration asynchronously for each new location. Its
+    // initial catalog can be empty even after the preview location is ready.
+    const pending = (async () => {
+      const deadline = Date.now() + 8_000;
+      do {
+        const response = await active.fetchJson("/api/provider", { directory, timeoutMs: 5_000 });
+        const payload = isRecord(response.json) ? response.json.data : undefined;
+        if (response.status === 200 && Array.isArray(payload) && mirroredSpecs.every((spec) =>
+          payload.some((provider) => isRecord(provider) && provider.id === spec.id
+            && isRecord(provider.settings) && provider.settings.apiKey === spec.apiKey)
+        )) return;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      throw new Error("OpenCode v2 workspace provider configuration did not become ready");
+    })();
+    workspaceReadiness.set(directory, pending);
+    try { await pending; } catch (error) {
+      if (workspaceReadiness.get(directory) === pending) workspaceReadiness.delete(directory);
+      throw error;
+    }
+  }
+
   async function stop(): Promise<void> {
     await stopRuntime();
   }
 
   if (enabled) void start().catch(recordStartError);
-  return { status, setEnabled, setChatRouting, connection, stop };
+  return { status, setEnabled, setChatRouting, connection, ensureWorkspaceReady, stop };
 }

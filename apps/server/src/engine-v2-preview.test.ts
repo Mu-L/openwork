@@ -100,10 +100,11 @@ test("maps runtime provider fields and models to an OpenCode v2 spec", () => {
       id: "example",
       name: "Example Provider",
       baseUrl: "https://example.test/v1",
+      package: "@opencode-ai/ai/providers/openai-compatible",
       apiKey: "secret",
       models: [
-        { id: "model-a", name: "Model A" },
-        { id: "model-b", name: "model-b" },
+        { id: "model-a", name: "Model A", config: { name: "Model A" } },
+        { id: "model-b", name: "model-b", config: {} },
       ],
     }],
     skippedProviderIds: [],
@@ -144,4 +145,62 @@ test("sorts mapped and skipped provider IDs deterministically", () => {
   });
   expect(result.specs.map((spec) => spec.id)).toEqual(["alpha", "zebra"]);
   expect(result.skippedProviderIds).toEqual(["beta", "yak"]);
+});
+
+
+test("native organization providers retain their transport without an endpoint override", () => {
+  const result = mapRuntimeProvidersToV2Specs({
+    lpr_openai: { npm: "@ai-sdk/openai", options: { apiKey: "fixture-key" }, models: { coding: { id: "wire-model", name: "Coding", tool_call: false, limit: { context: 1000000, output: 64000 }, modalities: { input: ["text", "image", "pdf"], output: ["text"] } } } },
+    lpr_anthropic: { npm: "@ai-sdk/anthropic" },
+    lpr_router: { npm: "@openrouter/ai-sdk-provider" },
+    unknown: { npm: "untrusted-package", options: { baseURL: "https://example.test" } },
+  });
+  expect(result.skippedProviderIds).toEqual(["unknown"]);
+  expect(result.specs.map((spec) => spec.package)).toEqual([
+    "@opencode-ai/ai/providers/anthropic", "@opencode-ai/ai/providers/openai", "@opencode-ai/ai/providers/openrouter",
+  ]);
+  expect(result.specs.every((spec) => spec.baseUrl === undefined)).toBe(true);
+  expect(result.specs[1]?.models[0]?.config).toMatchObject({ id: "wire-model", tool_call: false, limit: { context: 1000000, output: 64000 } });
+});
+
+test("native provider api endpoint and headers survive conversion", () => {
+  expect(mapRuntimeProvidersToV2Specs({ native: {
+    npm: "@ai-sdk/openai", api: "https://api.openai.com/v1", options: { apiKey: "fixture", headers: { "x-tenant": "fixture" } },
+  } }).specs[0]).toMatchObject({ baseUrl: "https://api.openai.com/v1", package: "@opencode-ai/ai/providers/openai", headers: { "x-tenant": "fixture" } });
+});
+
+
+test("resolves only each provider's declared stored credential and omits missing credentials", () => {
+  const providers = {
+    native: { npm: "@ai-sdk/openai", env: ["NATIVE_API_KEY"] },
+    missing: { npm: "@ai-sdk/openai", env: ["MISSING_API_KEY"] },
+  };
+  const first = mapRuntimeProvidersToV2Specs(providers, new Map([["NATIVE_API_KEY", "key-one"], ["DATABASE_URL", "unrelated-secret"]]));
+  expect(first.specs[0]?.apiKey).toBe("key-one");
+  expect(first.skippedProviderIds).toEqual(["missing"]);
+  expect(JSON.stringify(first)).not.toContain("unrelated-secret");
+  const rotated = mapRuntimeProvidersToV2Specs(providers, new Map([["NATIVE_API_KEY", "key-two"]]));
+  expect(rotated.specs[0]?.apiKey).toBe("key-two");
+});
+
+
+test("catalog api metadata cannot redirect a stored credential off the native trusted origin", () => {
+  for (const api of ["http://127.0.0.1/v1", "https://attacker.example/v1", "https://api.openai.com.attacker.example/v1", "https://api.openai.com:444/v1", "https://user@api.openai.com/v1"]) {
+    const result = mapRuntimeProvidersToV2Specs({ native: { npm: "@ai-sdk/openai", api, env: ["NATIVE_API_KEY"] } }, new Map([["NATIVE_API_KEY", "private-fixture-key"]]));
+    expect(result.skippedProviderIds).toEqual(["native"]);
+    expect(result.specs).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain("private-fixture-key");
+  }
+});
+
+
+test("null or empty native endpoint overrides cannot bypass catalog origin validation", () => {
+  for (const baseURL of [null, "", "  ", 0, false, {}]) {
+    const result = mapRuntimeProvidersToV2Specs({ native: {
+      npm: "@ai-sdk/openai", api: "https://untrusted.example/v1",
+      options: { baseURL }, env: ["NATIVE_API_KEY"],
+    } }, new Map([["NATIVE_API_KEY", "private-fixture-key"]]));
+    expect(result.skippedProviderIds).toEqual(["native"]);
+    expect(result.specs).toEqual([]);
+  }
 });
