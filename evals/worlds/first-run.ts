@@ -984,3 +984,72 @@ export async function managedVaultWorld(_seed: Seed, { place }: { place: Place }
     },
   };
 }
+
+export async function backgroundUpdateWorld(seed: Seed) {
+  const app = await seed.desktop({ name: "background-update", signIn: false });
+  const workspace = await seed.workspace(app, seed.tmpPath("background-update"));
+  await evalIn(app, `(async () => {
+    const currentVersion = "0.18.0";
+    const now = Date.now.bind(Date);
+    const state = { checks: 0, downloads: 0, installs: 0, offset: 0, finishDownload: null, intervalCheck: null };
+    window.__backgroundUpdateWitness = state;
+    const schedule = window.setInterval.bind(window);
+    window.setInterval = (callback, delay, ...args) => {
+      if (delay === 15 * 60 * 1000) state.intervalCheck = callback;
+      return schedule(callback, delay, ...args);
+    };
+    Date.now = () => now() + state.offset;
+    window.__openworkReadDesktopVersionMetadataEval = () => ({
+      minAppVersion: "0.1.0", latestAppVersion: "9.9.9", publishedDesktopVersions: ["9.9.9"],
+    });
+    window.__openworkApplyDesktopConfig?.({});
+    window.__openworkSetDesktopConfigRefreshResult?.({});
+    window.__openworkUpdaterEvalBridge = {
+      getChannel: async () => ({ channel: "stable", currentVersion }),
+      setChannel: async (channel) => ({ channel, currentVersion }),
+      check: async () => {
+        state.checks++;
+        return { available: state.checks >= 4, channel: "stable", currentVersion, latestVersion: state.checks >= 4 ? "9.9.9" : currentVersion };
+      },
+      download: async () => {
+        state.downloads++;
+        return new Promise(resolve => { state.finishDownload = () => resolve({ ok: true }); });
+      },
+      installAndRestart: async () => { state.installs++; return { ok: true }; },
+      onDownloadProgress: () => () => {},
+    };
+    state.offset += 16 * 60 * 1000;
+    window.dispatchEvent(new Event("focus"));
+  })()`, { awaitPromise: true });
+  return {
+    app,
+    snapshot: () => evalIn(app, `(() => {
+      const { checks, downloads, installs } = window.__backgroundUpdateWitness;
+      return {
+        checks, downloads, installs, route: location.hash,
+        updateInTitlebar: Boolean(document.querySelector('header [data-update-capsule]')),
+        updateInSidebar: Boolean(document.querySelector('[data-sidebar="footer"] [data-update-capsule]')),
+        sidebarName: document.querySelector('[data-sidebar-brand]')?.textContent?.trim() ?? null,
+        customLogoLoaded: Boolean(document.querySelector('[data-testid="brand-logo"] img')?.naturalWidth),
+      };
+    })()`),
+    setCustomBranding: () => evalIn(app, `(() => {
+      const logo = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="32"><rect width="120" height="32" rx="5" fill="#25262b"/><text x="12" y="22" font-family="sans-serif" font-size="18" fill="white">Studio</text></svg>');
+      window.__openworkApplyDesktopConfig({ brandAppName: "Studio", brandLogoUrl: logo });
+    })()`),
+    tickUpdateInterval: () => evalIn(app, `(() => {
+      const state = window.__backgroundUpdateWitness;
+      if (!state.intervalCheck) throw new Error("Update interval was not registered");
+      state.offset += 15 * 60 * 1000;
+      state.intervalCheck();
+    })()`),
+    finishDownload: () => evalIn(app, `window.__backgroundUpdateWitness.finishDownload()`),
+    returnToApp: () => evalIn(app, `(() => {
+      window.__backgroundUpdateWitness.offset += 16 * 60 * 1000;
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("online"));
+    })()`),
+    openSettings: () => go(app, `/workspace/${workspace.workspaceId}/settings/updates`),
+    openWorkspace: () => go(app, `/workspace/${workspace.workspaceId}/session`),
+  };
+}
